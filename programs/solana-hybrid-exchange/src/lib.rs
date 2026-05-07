@@ -17,4 +17,12 @@ pub mod solana_hybrid_exchange {
     pub fn init_market(ctx: Context<InitMarket>) -> Result<()> {
         instructions::init_market::handler(ctx)
     }
+
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        instructions::deposit::handler(ctx, amount)
+    }
+
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        instructions::withdraw::handler(ctx, amount)
+    }
 }
