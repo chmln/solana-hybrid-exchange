@@ -23,44 +23,44 @@ pub struct Settle<'info> {
     pub operator: Signer<'info>,
 
     #[account(
-        seeds = [MARKET_SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
+        seeds = [MARKET_SEED, market.load()?.base_mint.as_ref(), market.load()?.quote_mint.as_ref()],
+        bump = market.load()?.bump,
     )]
-    pub market: Account<'info, Market>,
+    pub market: AccountLoader<'info, Market>,
 
     #[account(
         mut,
-        seeds = [USER_ACCOUNT_SEED, market.key().as_ref(), maker_user_account.owner.as_ref()],
-        bump = maker_user_account.bump,
-        has_one = market,
+        seeds = [USER_ACCOUNT_SEED, market.key().as_ref(), maker_user_account.load()?.owner.as_ref()],
+        bump = maker_user_account.load()?.bump,
+        constraint = maker_user_account.load()?.market == market.key(),
     )]
-    pub maker_user_account: Account<'info, UserAccount>,
+    pub maker_user_account: AccountLoader<'info, UserAccount>,
 
     #[account(
         mut,
-        seeds = [USER_ACCOUNT_SEED, market.key().as_ref(), taker_user_account.owner.as_ref()],
-        bump = taker_user_account.bump,
-        has_one = market,
+        seeds = [USER_ACCOUNT_SEED, market.key().as_ref(), taker_user_account.load()?.owner.as_ref()],
+        bump = taker_user_account.load()?.bump,
+        constraint = taker_user_account.load()?.market == market.key(),
     )]
-    pub taker_user_account: Account<'info, UserAccount>,
+    pub taker_user_account: AccountLoader<'info, UserAccount>,
 
     #[account(
         init_if_needed,
         payer = operator,
-        space = 8 + OrderMarker::INIT_SPACE,
+        space = 8 + std::mem::size_of::<OrderMarker>(),
         seeds = [ORDER_MARKER_SEED, maker_order_hash.as_ref()],
         bump,
     )]
-    pub maker_order_marker: Account<'info, OrderMarker>,
+    pub maker_order_marker: AccountLoader<'info, OrderMarker>,
 
     #[account(
         init_if_needed,
         payer = operator,
-        space = 8 + OrderMarker::INIT_SPACE,
+        space = 8 + std::mem::size_of::<OrderMarker>(),
         seeds = [ORDER_MARKER_SEED, taker_order_hash.as_ref()],
         bump,
     )]
-    pub taker_order_marker: Account<'info, OrderMarker>,
+    pub taker_order_marker: AccountLoader<'info, OrderMarker>,
 
     /// CHECK: address-pinned to the Instructions sysvar; used for Ed25519 precompile verification.
     #[account(address = IX_SYSVAR_ID)]
@@ -103,12 +103,12 @@ pub(crate) fn handler(
     require!(fill_size > 0, ExchangeError::ZeroFillSize);
 
     require_keys_eq!(
-        ctx.accounts.maker_user_account.owner,
+        ctx.accounts.maker_user_account.load()?.owner,
         maker.user,
         ExchangeError::Ed25519DataMismatch
     );
     require_keys_eq!(
-        ctx.accounts.taker_user_account.owner,
+        ctx.accounts.taker_user_account.load()?.owner,
         taker.user,
         ExchangeError::Ed25519DataMismatch
     );
@@ -132,37 +132,49 @@ pub(crate) fn handler(
     let earliest_expiry = maker.expiry.min(taker.expiry);
     require!(now < earliest_expiry, ExchangeError::OrderExpired);
 
-    update_marker(
-        &mut ctx.accounts.maker_order_marker,
-        ctx.bumps.maker_order_marker,
-        fill_size,
-        maker.max_size,
-    )?;
-    update_marker(
-        &mut ctx.accounts.taker_order_marker,
-        ctx.bumps.taker_order_marker,
-        fill_size,
-        taker.max_size,
-    )?;
+    {
+        let mut maker_marker = ctx
+            .accounts
+            .maker_order_marker
+            .load_init()
+            .or_else(|_| ctx.accounts.maker_order_marker.load_mut())?;
+        update_marker(
+            &mut maker_marker,
+            ctx.bumps.maker_order_marker,
+            fill_size,
+            maker.max_size,
+        )?;
+    }
+    {
+        let mut taker_marker = ctx
+            .accounts
+            .taker_order_marker
+            .load_init()
+            .or_else(|_| ctx.accounts.taker_order_marker.load_mut())?;
+        update_marker(
+            &mut taker_marker,
+            ctx.bumps.taker_order_marker,
+            fill_size,
+            taker.max_size,
+        )?;
+    }
 
+    let price_scale = ctx.accounts.market.load()?.price_scale;
     let quote_amount_u128 = (fill_price as u128)
         .checked_mul(fill_size as u128)
         .ok_or(ExchangeError::Overflow)?
-        / (ctx.accounts.market.price_scale as u128);
+        / (price_scale as u128);
     let quote_amount: u64 = quote_amount_u128
         .try_into()
         .map_err(|_| error!(ExchangeError::Overflow))?;
 
+    let mut maker_ua = ctx.accounts.maker_user_account.load_mut()?;
+    let mut taker_ua = ctx.accounts.taker_user_account.load_mut()?;
+
     let (buyer, seller) = if bid_is_maker {
-        (
-            &mut ctx.accounts.maker_user_account,
-            &mut ctx.accounts.taker_user_account,
-        )
+        (&mut *maker_ua, &mut *taker_ua)
     } else {
-        (
-            &mut ctx.accounts.taker_user_account,
-            &mut ctx.accounts.maker_user_account,
-        )
+        (&mut *taker_ua, &mut *maker_ua)
     };
 
     buyer.quote_free = buyer
@@ -208,12 +220,7 @@ fn verify_precompile(
     Ok(())
 }
 
-fn update_marker(
-    marker: &mut Account<OrderMarker>,
-    bump: u8,
-    fill_size: u64,
-    max_size: u64,
-) -> Result<()> {
+fn update_marker(marker: &mut OrderMarker, bump: u8, fill_size: u64, max_size: u64) -> Result<()> {
     if marker.bump == 0 {
         marker.bump = bump;
         marker.filled_size = 0;

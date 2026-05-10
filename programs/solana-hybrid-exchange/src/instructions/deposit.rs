@@ -12,19 +12,19 @@ pub struct Deposit<'info> {
     pub user: Signer<'info>,
 
     #[account(
-        seeds = [MARKET_SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
+        seeds = [MARKET_SEED, market.load()?.base_mint.as_ref(), market.load()?.quote_mint.as_ref()],
+        bump = market.load()?.bump,
     )]
-    pub market: Account<'info, Market>,
+    pub market: AccountLoader<'info, Market>,
 
     #[account(
         init_if_needed,
         payer = user,
-        space = 8 + UserAccount::INIT_SPACE,
+        space = 8 + std::mem::size_of::<UserAccount>(),
         seeds = [USER_ACCOUNT_SEED, market.key().as_ref(), user.key().as_ref()],
         bump,
     )]
-    pub user_account: Account<'info, UserAccount>,
+    pub user_account: AccountLoader<'info, UserAccount>,
 
     #[account(
         mut,
@@ -43,24 +43,38 @@ pub struct Deposit<'info> {
 }
 
 pub(crate) fn handler(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-    let market = &ctx.accounts.market;
     let mint_key = ctx.accounts.mint.key();
     let vault_key = ctx.accounts.vault.key();
+    let market_key = ctx.accounts.market.key();
 
-    let is_base = mint_key == market.base_mint;
-    let is_quote = mint_key == market.quote_mint;
+    let (base_mint, quote_mint, base_vault, quote_vault) = {
+        let market = ctx.accounts.market.load()?;
+        (
+            market.base_mint,
+            market.quote_mint,
+            market.base_vault,
+            market.quote_vault,
+        )
+    };
+
+    let is_base = mint_key == base_mint;
+    let is_quote = mint_key == quote_mint;
     require!(is_base || is_quote, ExchangeError::WrongMint);
 
     if is_base {
-        require_keys_eq!(vault_key, market.base_vault, ExchangeError::WrongMint);
+        require_keys_eq!(vault_key, base_vault, ExchangeError::WrongMint);
     } else {
-        require_keys_eq!(vault_key, market.quote_vault, ExchangeError::WrongMint);
+        require_keys_eq!(vault_key, quote_vault, ExchangeError::WrongMint);
     }
 
-    let user_account = &mut ctx.accounts.user_account;
+    let mut user_account = ctx
+        .accounts
+        .user_account
+        .load_init()
+        .or_else(|_| ctx.accounts.user_account.load_mut())?;
     if user_account.owner == Pubkey::default() {
         user_account.owner = ctx.accounts.user.key();
-        user_account.market = market.key();
+        user_account.market = market_key;
         user_account.base_free = 0;
         user_account.quote_free = 0;
         user_account.bump = ctx.bumps.user_account;

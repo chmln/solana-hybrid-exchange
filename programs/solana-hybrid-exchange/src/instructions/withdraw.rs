@@ -12,19 +12,19 @@ pub struct Withdraw<'info> {
     pub user: Signer<'info>,
 
     #[account(
-        seeds = [MARKET_SEED, market.base_mint.as_ref(), market.quote_mint.as_ref()],
-        bump = market.bump,
+        seeds = [MARKET_SEED, market.load()?.base_mint.as_ref(), market.load()?.quote_mint.as_ref()],
+        bump = market.load()?.bump,
     )]
-    pub market: Account<'info, Market>,
+    pub market: AccountLoader<'info, Market>,
 
     #[account(
         mut,
         seeds = [USER_ACCOUNT_SEED, market.key().as_ref(), user.key().as_ref()],
-        bump = user_account.bump,
-        has_one = market,
-        constraint = user_account.owner == user.key() @ ExchangeError::InsufficientFreeBalance,
+        bump = user_account.load()?.bump,
+        constraint = user_account.load()?.market == market.key() @ ExchangeError::InsufficientFreeBalance,
+        constraint = user_account.load()?.owner == user.key() @ ExchangeError::InsufficientFreeBalance,
     )]
-    pub user_account: Account<'info, UserAccount>,
+    pub user_account: AccountLoader<'info, UserAccount>,
 
     #[account(
         mut,
@@ -42,36 +42,45 @@ pub struct Withdraw<'info> {
 }
 
 pub(crate) fn handler(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-    let market = &ctx.accounts.market;
     let mint_key = ctx.accounts.mint.key();
     let vault_key = ctx.accounts.vault.key();
 
-    let is_base = mint_key == market.base_mint;
-    let is_quote = mint_key == market.quote_mint;
+    let (base_mint, quote_mint, base_vault, quote_vault, market_bump) = {
+        let market = ctx.accounts.market.load()?;
+        (
+            market.base_mint,
+            market.quote_mint,
+            market.base_vault,
+            market.quote_vault,
+            market.bump,
+        )
+    };
+
+    let is_base = mint_key == base_mint;
+    let is_quote = mint_key == quote_mint;
     require!(is_base || is_quote, ExchangeError::WrongMint);
 
     if is_base {
-        require_keys_eq!(vault_key, market.base_vault, ExchangeError::WrongMint);
+        require_keys_eq!(vault_key, base_vault, ExchangeError::WrongMint);
     } else {
-        require_keys_eq!(vault_key, market.quote_vault, ExchangeError::WrongMint);
+        require_keys_eq!(vault_key, quote_vault, ExchangeError::WrongMint);
     }
 
-    let user_account = &mut ctx.accounts.user_account;
-    if is_base {
-        user_account.base_free = user_account
-            .base_free
-            .checked_sub(amount)
-            .ok_or(ExchangeError::InsufficientFreeBalance)?;
-    } else {
-        user_account.quote_free = user_account
-            .quote_free
-            .checked_sub(amount)
-            .ok_or(ExchangeError::InsufficientFreeBalance)?;
+    {
+        let mut user_account = ctx.accounts.user_account.load_mut()?;
+        if is_base {
+            user_account.base_free = user_account
+                .base_free
+                .checked_sub(amount)
+                .ok_or(ExchangeError::InsufficientFreeBalance)?;
+        } else {
+            user_account.quote_free = user_account
+                .quote_free
+                .checked_sub(amount)
+                .ok_or(ExchangeError::InsufficientFreeBalance)?;
+        }
     }
 
-    let base_mint = market.base_mint;
-    let quote_mint = market.quote_mint;
-    let market_bump = market.bump;
     let signer_seeds: &[&[&[u8]]] = &[&[
         MARKET_SEED,
         base_mint.as_ref(),

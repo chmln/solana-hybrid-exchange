@@ -1,7 +1,8 @@
 use anchor_lang::prelude::*;
 
-#[account]
-#[derive(InitSpace)]
+#[account(zero_copy(unsafe))]
+#[repr(C)]
+#[derive(Default)]
 pub struct UserAccount {
     pub owner: Pubkey,
     pub market: Pubkey,

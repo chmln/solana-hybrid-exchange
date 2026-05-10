@@ -30,11 +30,11 @@ pub struct InitMarket<'info> {
     #[account(
         init,
         payer = admin,
-        space = 8 + Market::INIT_SPACE,
+        space = 8 + std::mem::size_of::<Market>(),
         seeds = [MARKET_SEED, base_mint.key().as_ref(), quote_mint.key().as_ref()],
         bump,
     )]
-    pub market: Account<'info, Market>,
+    pub market: AccountLoader<'info, Market>,
 
     #[account(
         init,
@@ -81,7 +81,7 @@ pub(crate) fn handler(ctx: Context<InitMarket>) -> Result<()> {
         .checked_pow(quote_decimals as u32)
         .ok_or(ExchangeError::Overflow)?;
 
-    let market = &mut ctx.accounts.market;
+    let mut market = ctx.accounts.market.load_init()?;
     market.admin = ctx.accounts.admin.key();
     market.base_mint = ctx.accounts.base_mint.key();
     market.quote_mint = ctx.accounts.quote_mint.key();
