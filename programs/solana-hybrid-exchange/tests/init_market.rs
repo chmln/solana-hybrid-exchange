@@ -16,8 +16,6 @@ use {
     solana_signer::Signer,
 };
 
-const RENT_SYSVAR_ID: Pubkey = anchor_lang::pubkey!("SysvarRent111111111111111111111111111111111");
-
 /// Anchor user error codes start at 6000.
 const ERR_MINT_HAS_DISALLOWED_EXTENSION: u32 = 6000;
 
@@ -48,7 +46,6 @@ fn build_init_market_ix(
         quote_vault: *quote_vault,
         token_program: spl_token_2022::id(),
         system_program: SYSTEM_PROGRAM_ID,
-        rent: RENT_SYSVAR_ID,
     };
     Instruction::new_with_bytes(
         solana_hybrid_exchange::id(),

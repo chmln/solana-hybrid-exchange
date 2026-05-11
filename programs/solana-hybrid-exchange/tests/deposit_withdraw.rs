@@ -17,8 +17,6 @@ use {
     solana_signer::Signer,
 };
 
-const RENT_SYSVAR_ID: Pubkey = anchor_lang::pubkey!("SysvarRent111111111111111111111111111111111");
-
 // Anchor user error codes start at 6000; ordering must match `src/error.rs`.
 const ERR_WRONG_MINT: u32 = 6002;
 const ERR_INSUFFICIENT_FREE_BALANCE: u32 = 6003;
@@ -79,7 +77,6 @@ fn setup_market() -> MarketCtx {
         quote_vault: quote_vault_kp.pubkey(),
         token_program: spl_token_2022::id(),
         system_program: SYSTEM_PROGRAM_ID,
-        rent: RENT_SYSVAR_ID,
     };
     let ix = Instruction::new_with_bytes(
         solana_hybrid_exchange::id(),

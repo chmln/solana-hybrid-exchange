@@ -11,7 +11,7 @@ use {
     litesvm::{types::FailedTransactionMetadata, LiteSVM},
     solana_hybrid_exchange::{
         accounts as program_accounts, instruction as program_ix,
-        order::{canonical_serialize, Side, SignedOrderArgs, IX_SYSVAR_ID},
+        order::{canonical_serialize, OrderHash, Side, SignedOrderArgs, IX_SYSVAR_ID},
         state::{OrderMarker, UserAccount},
     },
     solana_keypair::Keypair,
@@ -21,16 +21,15 @@ use {
 
 // Anchor user error codes start at 6000. Indices match `ExchangeError` declaration order.
 const ERR_INSUFFICIENT_FREE_BALANCE: u32 = 6003;
-const ERR_ED25519_DATA_MISMATCH: u32 = 6005;
-const ERR_SAME_SIDE: u32 = 6007;
-const ERR_PRICE_DOES_NOT_CROSS: u32 = 6008;
-const ERR_FILL_PRICE_OUT_OF_RANGE: u32 = 6009;
-const ERR_ORDER_EXPIRED: u32 = 6010;
-const ERR_ORDER_OVERFILLED: u32 = 6011;
-const ERR_ZERO_FILL_SIZE: u32 = 6012;
-
-const RENT_SYSVAR_ID: anchor_lang::prelude::Pubkey =
-    anchor_lang::pubkey!("SysvarRent111111111111111111111111111111111");
+const ERR_MISSING_ED25519_VERIFY: u32 = 6004;
+const ERR_ORDER_HASH_MISMATCH: u32 = 6006;
+const ERR_WRONG_MARKET: u32 = 6007;
+const ERR_SAME_SIDE: u32 = 6008;
+const ERR_PRICE_DOES_NOT_CROSS: u32 = 6009;
+const ERR_FILL_PRICE_OUT_OF_RANGE: u32 = 6010;
+const ERR_ORDER_EXPIRED: u32 = 6011;
+const ERR_ORDER_OVERFILLED: u32 = 6012;
+const ERR_ZERO_FILL_SIZE: u32 = 6013;
 
 fn has_custom_error(meta: &FailedTransactionMetadata, code: u32) -> bool {
     let dbg = format!("{:?}", meta.err);
@@ -91,7 +90,6 @@ fn setup_market_with_users(base_deposit: u64, quote_deposit: u64) -> Setup {
             quote_vault: quote_vault_kp.pubkey(),
             token_program: spl_token_2022::id(),
             system_program: SYSTEM_PROGRAM_ID,
-            rent: RENT_SYSVAR_ID,
         }
         .to_account_metas(None),
     );
@@ -265,8 +263,8 @@ fn build_settle_ixs(
             taker: taker_order_args,
             fill_price,
             fill_size,
-            maker_order_hash: maker_signed.hash,
-            taker_order_hash: taker_signed.hash,
+            maker_order_hash: OrderHash(maker_signed.hash),
+            taker_order_hash: OrderHash(taker_signed.hash),
         }
         .data(),
         program_accounts::Settle {
@@ -304,31 +302,47 @@ fn quote_for(fill_price: u64, fill_size: u64) -> u64 {
     ((fill_price as u128) * (fill_size as u128) / (PRICE_SCALE as u128)) as u64
 }
 
+fn default_bid(
+    user: anchor_lang::prelude::Pubkey,
+    market: anchor_lang::prelude::Pubkey,
+) -> SignedOrderArgs {
+    SignedOrderArgs {
+        user,
+        market,
+        side: Side::Bid,
+        limit_price: 1_000_000,
+        max_size: 1000,
+        nonce: 1,
+        expiry: i64::MAX,
+    }
+}
+
+fn default_ask(
+    user: anchor_lang::prelude::Pubkey,
+    market: anchor_lang::prelude::Pubkey,
+) -> SignedOrderArgs {
+    SignedOrderArgs {
+        user,
+        market,
+        side: Side::Ask,
+        limit_price: 1_000_000,
+        max_size: 1000,
+        nonce: 2,
+        expiry: i64::MAX,
+    }
+}
+
 #[test]
 fn settle_happy_path() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
-    let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
-    };
-    let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
-    };
+    let maker_order = default_bid(s.maker.pubkey(), s.market);
+    let taker_order = default_ask(s.taker.pubkey(), s.market);
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
 
+    let fill_price = 1_000_000u64;
+    let fill_size = 1000u64;
     let ixs = build_settle_ixs(
         &s.market,
         &s.operator.pubkey(),
@@ -336,55 +350,40 @@ fn settle_happy_path() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        100,
-        1000,
+        fill_price,
+        fill_size,
     );
     send_tx(&mut s.svm, &ixs, &[&s.operator]).expect("settle happy-path failed");
 
-    let q = quote_for(100, 1000);
+    let q = quote_for(fill_price, fill_size);
     let maker_pda = user_account_pda(&s.market, &s.maker.pubkey()).0;
     let taker_pda = user_account_pda(&s.market, &s.taker.pubkey()).0;
     let maker_state = read_user(&s.svm, &maker_pda);
     let taker_state = read_user(&s.svm, &taker_pda);
 
     // Maker is bidder: gains base, loses quote.
-    assert_eq!(maker_state.base_free, BASE_DEPOSIT + 1000);
+    assert_eq!(maker_state.base_free, BASE_DEPOSIT + fill_size);
     assert_eq!(maker_state.quote_free, QUOTE_DEPOSIT - q);
     // Taker is asker: loses base, gains quote.
-    assert_eq!(taker_state.base_free, BASE_DEPOSIT - 1000);
+    assert_eq!(taker_state.base_free, BASE_DEPOSIT - fill_size);
     assert_eq!(taker_state.quote_free, QUOTE_DEPOSIT + q);
 
     let maker_marker = read_marker(&s.svm, &order_marker_pda(&maker_signed.hash).0);
     let taker_marker = read_marker(&s.svm, &order_marker_pda(&taker_signed.hash).0);
-    assert_eq!(maker_marker.filled_size, 1000);
-    assert_eq!(taker_marker.filled_size, 1000);
+    assert_eq!(maker_marker.filled_size, fill_size);
+    assert_eq!(taker_marker.filled_size, fill_size);
 }
 
 #[test]
 fn settle_two_partial_fills() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
-    let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
-    };
-    let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
-    };
+    let maker_order = default_bid(s.maker.pubkey(), s.market);
+    let taker_order = default_ask(s.taker.pubkey(), s.market);
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
 
+    let fill_price = 1_000_000u64;
     for _ in 0..2 {
         let ixs = build_settle_ixs(
             &s.market,
@@ -393,14 +392,14 @@ fn settle_two_partial_fills() {
             taker_order,
             &maker_signed,
             &taker_signed,
-            100,
+            fill_price,
             500,
         );
         send_tx(&mut s.svm, &ixs, &[&s.operator]).expect("partial fill failed");
         s.svm.expire_blockhash();
     }
 
-    let q = quote_for(100, 1000);
+    let q = quote_for(fill_price, 1000);
     let maker_state = read_user(&s.svm, &user_account_pda(&s.market, &s.maker.pubkey()).0);
     let taker_state = read_user(&s.svm, &user_account_pda(&s.market, &s.taker.pubkey()).0);
     assert_eq!(maker_state.base_free, BASE_DEPOSIT + 1000);
@@ -418,27 +417,12 @@ fn settle_two_partial_fills() {
 fn settle_overfill_rejected() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
-    let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
-    };
-    let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
-    };
+    let maker_order = default_bid(s.maker.pubkey(), s.market);
+    let taker_order = default_ask(s.taker.pubkey(), s.market);
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
 
+    let fill_price = 1_000_000u64;
     let ixs = build_settle_ixs(
         &s.market,
         &s.operator.pubkey(),
@@ -446,7 +430,7 @@ fn settle_overfill_rejected() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        100,
+        fill_price,
         1000,
     );
     send_tx(&mut s.svm, &ixs, &[&s.operator]).expect("first settle failed");
@@ -459,7 +443,7 @@ fn settle_overfill_rejected() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        100,
+        fill_price,
         1,
     );
     let err = send_tx(&mut s.svm, &ixs, &[&s.operator])
@@ -476,27 +460,12 @@ fn settle_overfill_rejected() {
 fn settle_full_replay_rejected() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
-    let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
-    };
-    let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
-    };
+    let maker_order = default_bid(s.maker.pubkey(), s.market);
+    let taker_order = default_ask(s.taker.pubkey(), s.market);
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
 
+    let fill_price = 1_000_000u64;
     let ixs = build_settle_ixs(
         &s.market,
         &s.operator.pubkey(),
@@ -504,7 +473,7 @@ fn settle_full_replay_rejected() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        100,
+        fill_price,
         1000,
     );
     send_tx(&mut s.svm, &ixs, &[&s.operator]).expect("first settle failed");
@@ -517,7 +486,7 @@ fn settle_full_replay_rejected() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        100,
+        fill_price,
         1000,
     );
     let err = send_tx(&mut s.svm, &ixs, &[&s.operator]).expect_err("replay should reject overfill");
@@ -533,24 +502,8 @@ fn settle_full_replay_rejected() {
 fn settle_zero_fill_size_rejected() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
-    let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
-    };
-    let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
-    };
+    let maker_order = default_bid(s.maker.pubkey(), s.market);
+    let taker_order = default_ask(s.taker.pubkey(), s.market);
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
 
@@ -561,7 +514,7 @@ fn settle_zero_fill_size_rejected() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        100,
+        1_000_000,
         0,
     );
     let err = send_tx(&mut s.svm, &ixs, &[&s.operator]).expect_err("zero fill should be rejected");
@@ -577,37 +530,20 @@ fn settle_zero_fill_size_rejected() {
 fn settle_tampered_args_rejected() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
-    let signed_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
-    };
-    let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
-    };
+    let signed_order = default_bid(s.maker.pubkey(), s.market);
+    let taker_order = default_ask(s.taker.pubkey(), s.market);
     let maker_signed = sign_order(&s.maker, &signed_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
 
-    // Tamper: pass settle args with a different limit_price than what was signed.
-    // The precompile still verifies the original bytes (it sees them inline), but the
-    // handler compares hash(canonical_serialize(new_args)) and rejects.
-    let mut tampered_args = signed_order;
-    tampered_args.limit_price = 110;
+    // Tamper: pass settle args with a different limit_price than what was signed. The
+    // precompile carries the original message bytes; the handler canonicalizes tampered
+    // bytes. No precompile message matches the tampered canonical bytes, so the scan
+    // fails to find a maker precompile and rejects with MissingEd25519Verify.
+    let tampered_args = SignedOrderArgs {
+        limit_price: 110,
+        ..signed_order
+    };
 
-    // The handler checks maker_order_hash matches canonical_serialize(maker) (the args),
-    // so if we pass the ORIGINAL hash, that's the first check it fails. Pass the tampered
-    // hash to bypass that and force the precompile-mismatch path. But the marker PDA is
-    // derived from the hash too — we need a coherent setup so the precompile path is hit.
     let tampered_bytes = canonical_serialize(&tampered_args).to_vec();
     let tampered_hash: [u8; 32] = hashv(&[&tampered_bytes]).to_bytes();
 
@@ -619,10 +555,10 @@ fn settle_tampered_args_rejected() {
         &program_ix::Settle {
             maker: tampered_args,
             taker: taker_order,
-            fill_price: 100,
+            fill_price: 1_000_000,
             fill_size: 500,
-            maker_order_hash: tampered_hash,
-            taker_order_hash: taker_signed.hash,
+            maker_order_hash: OrderHash(tampered_hash),
+            taker_order_hash: OrderHash(taker_signed.hash),
         }
         .data(),
         program_accounts::Settle {
@@ -641,8 +577,8 @@ fn settle_tampered_args_rejected() {
     let err = send_tx(&mut s.svm, &[ed_maker, ed_taker, settle_ix], &[&s.operator])
         .expect_err("tampered args should be rejected");
     assert!(
-        has_custom_error(&err, ERR_ED25519_DATA_MISMATCH),
-        "expected Ed25519DataMismatch, got err={:?} logs={:?}",
+        has_custom_error(&err, ERR_MISSING_ED25519_VERIFY),
+        "expected MissingEd25519Verify, got err={:?} logs={:?}",
         err.err,
         err.meta.logs,
     );
@@ -652,24 +588,8 @@ fn settle_tampered_args_rejected() {
 fn settle_bad_signature_rejected() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
-    let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
-    };
-    let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
-    };
+    let maker_order = default_bid(s.maker.pubkey(), s.market);
+    let taker_order = default_ask(s.taker.pubkey(), s.market);
     let mut maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
 
@@ -683,7 +603,7 @@ fn settle_bad_signature_rejected() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        100,
+        1_000_000,
         500,
     );
     let err =
@@ -720,23 +640,10 @@ fn settle_expired_rejected() {
         .set_sysvar::<anchor_lang::solana_program::clock::Clock>(&clock);
 
     let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
         expiry: 1, // long past
+        ..default_bid(s.maker.pubkey(), s.market)
     };
-    let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
-    };
+    let taker_order = default_ask(s.taker.pubkey(), s.market);
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
 
@@ -747,7 +654,7 @@ fn settle_expired_rejected() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        100,
+        1_000_000,
         500,
     );
     let err =
@@ -764,23 +671,10 @@ fn settle_expired_rejected() {
 fn settle_same_side_rejected() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
-    let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
-    };
+    let maker_order = default_bid(s.maker.pubkey(), s.market);
     let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
         side: Side::Bid, // same side
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
+        ..default_ask(s.taker.pubkey(), s.market)
     };
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
@@ -792,7 +686,7 @@ fn settle_same_side_rejected() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        100,
+        1_000_000,
         500,
     );
     let err = send_tx(&mut s.svm, &ixs, &[&s.operator]).expect_err("same-side should be rejected");
@@ -809,22 +703,12 @@ fn settle_price_does_not_cross_rejected() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
     let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 50, // bid below ask
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
+        limit_price: 500_000, // bid below ask
+        ..default_bid(s.maker.pubkey(), s.market)
     };
     let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
+        limit_price: 1_000_000,
+        ..default_ask(s.taker.pubkey(), s.market)
     };
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
@@ -836,7 +720,7 @@ fn settle_price_does_not_cross_rejected() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        75,
+        750_000,
         500,
     );
     let err = send_tx(&mut s.svm, &ixs, &[&s.operator])
@@ -853,24 +737,14 @@ fn settle_price_does_not_cross_rejected() {
 fn settle_fill_price_out_of_range() {
     let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
 
-    // bid @ 100, ask @ 50 → crosses. Range is [50, 100]. fill_price=200 is out of range.
+    // bid @ 1_000_000, ask @ 500_000 → crosses. Range is [500_000, 1_000_000]. fill=2_000_000 out.
     let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
-        limit_price: 100,
-        max_size: 1000,
-        nonce: 1,
-        expiry: i64::MAX,
+        limit_price: 1_000_000,
+        ..default_bid(s.maker.pubkey(), s.market)
     };
     let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
-        limit_price: 50,
-        max_size: 1000,
-        nonce: 2,
-        expiry: i64::MAX,
+        limit_price: 500_000,
+        ..default_ask(s.taker.pubkey(), s.market)
     };
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
@@ -882,7 +756,7 @@ fn settle_fill_price_out_of_range() {
         taker_order,
         &maker_signed,
         &taker_signed,
-        200,
+        2_000_000,
         500,
     );
     let err = send_tx(&mut s.svm, &ixs, &[&s.operator])
@@ -897,27 +771,19 @@ fn settle_fill_price_out_of_range() {
 
 #[test]
 fn settle_buyer_underflow_rejected() {
-    // Buyer deposits only 1 quote unit (and some base for the seller side).
-    // quote_for(100, 1_000_000) = 100_000_000 / 1_000_000 = 100 quote units → buyer can't pay.
+    // Buyer deposits only 1 quote unit (and base for the seller side).
+    // quote_for(100, 1_000_000) = 100 quote units → buyer can't pay.
     let mut s = setup_market_with_users(10_000_000, 1);
 
     let maker_order = SignedOrderArgs {
-        user: s.maker.pubkey(),
-        market: s.market,
-        side: Side::Bid,
         limit_price: 100,
         max_size: 10_000_000,
-        nonce: 1,
-        expiry: i64::MAX,
+        ..default_bid(s.maker.pubkey(), s.market)
     };
     let taker_order = SignedOrderArgs {
-        user: s.taker.pubkey(),
-        market: s.market,
-        side: Side::Ask,
         limit_price: 100,
         max_size: 10_000_000,
-        nonce: 2,
-        expiry: i64::MAX,
+        ..default_ask(s.taker.pubkey(), s.market)
     };
     let maker_signed = sign_order(&s.maker, &maker_order);
     let taker_signed = sign_order(&s.taker, &taker_order);
@@ -937,6 +803,94 @@ fn settle_buyer_underflow_rejected() {
     assert!(
         has_custom_error(&err, ERR_INSUFFICIENT_FREE_BALANCE),
         "expected InsufficientFreeBalance, got err={:?} logs={:?}",
+        err.err,
+        err.meta.logs,
+    );
+}
+
+#[test]
+fn settle_wrong_market_rejected() {
+    let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
+
+    let bogus_market = anchor_lang::prelude::Pubkey::new_unique();
+
+    // maker.market matches the on-chain market account; taker.market is a different pubkey
+    // that doesn't equal the settle ix's `market` account. The handler's require_keys_eq
+    // on taker.market vs market.key() should reject with WrongMarket.
+    let maker_order = default_bid(s.maker.pubkey(), s.market);
+    let taker_order = SignedOrderArgs {
+        market: bogus_market,
+        ..default_ask(s.taker.pubkey(), s.market)
+    };
+    let maker_signed = sign_order(&s.maker, &maker_order);
+    let taker_signed = sign_order(&s.taker, &taker_order);
+
+    let ixs = build_settle_ixs(
+        &s.market,
+        &s.operator.pubkey(),
+        maker_order,
+        taker_order,
+        &maker_signed,
+        &taker_signed,
+        1_000_000,
+        500,
+    );
+    let err =
+        send_tx(&mut s.svm, &ixs, &[&s.operator]).expect_err("wrong-market should be rejected");
+    assert!(
+        has_custom_error(&err, ERR_WRONG_MARKET),
+        "expected WrongMarket, got err={:?} logs={:?}",
+        err.err,
+        err.meta.logs,
+    );
+}
+
+#[test]
+fn settle_hash_mismatch_rejected() {
+    let mut s = setup_market_with_users(BASE_DEPOSIT, QUOTE_DEPOSIT);
+
+    let maker_order = default_bid(s.maker.pubkey(), s.market);
+    let taker_order = default_ask(s.taker.pubkey(), s.market);
+    let maker_signed = sign_order(&s.maker, &maker_order);
+    let taker_signed = sign_order(&s.taker, &taker_order);
+
+    // Pass a wrong hash for maker. PDA seed becomes [ORDER_MARKER_SEED, wrong_hash]; anchor
+    // allocates that marker, then the handler's first check `expected_maker_hash == arg`
+    // rejects with OrderHashMismatch.
+    let wrong_hash = [0u8; 32];
+
+    let ed_maker = ed25519_verify_ix(&maker_signed.pk, &maker_signed.sig, &maker_signed.bytes);
+    let ed_taker = ed25519_verify_ix(&taker_signed.pk, &taker_signed.sig, &taker_signed.bytes);
+
+    let settle_ix = Instruction::new_with_bytes(
+        solana_hybrid_exchange::id(),
+        &program_ix::Settle {
+            maker: maker_order,
+            taker: taker_order,
+            fill_price: 1_000_000,
+            fill_size: 500,
+            maker_order_hash: OrderHash(wrong_hash),
+            taker_order_hash: OrderHash(taker_signed.hash),
+        }
+        .data(),
+        program_accounts::Settle {
+            operator: s.operator.pubkey(),
+            market: s.market,
+            maker_user_account: user_account_pda(&s.market, &s.maker.pubkey()).0,
+            taker_user_account: user_account_pda(&s.market, &s.taker.pubkey()).0,
+            maker_order_marker: order_marker_pda(&wrong_hash).0,
+            taker_order_marker: order_marker_pda(&taker_signed.hash).0,
+            instructions_sysvar: IX_SYSVAR_ID,
+            system_program: SYSTEM_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+    );
+
+    let err = send_tx(&mut s.svm, &[ed_maker, ed_taker, settle_ix], &[&s.operator])
+        .expect_err("hash mismatch should be rejected");
+    assert!(
+        has_custom_error(&err, ERR_ORDER_HASH_MISMATCH),
+        "expected OrderHashMismatch, got err={:?} logs={:?}",
         err.err,
         err.meta.logs,
     );

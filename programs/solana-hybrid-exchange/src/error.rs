@@ -14,6 +14,8 @@ pub enum ExchangeError {
     MissingEd25519Verify,
     #[msg("Ed25519 precompile pubkey or message does not match settle args")]
     Ed25519DataMismatch,
+    #[msg("Order hash arg does not match sha256(canonical_serialize(order))")]
+    OrderHashMismatch,
     #[msg("Maker and taker orders reference different markets")]
     WrongMarket,
     #[msg("Maker and taker orders are on the same side")]
@@ -28,6 +30,8 @@ pub enum ExchangeError {
     OrderOverfilled,
     #[msg("fill_size must be greater than zero")]
     ZeroFillSize,
+    #[msg("Computed quote_amount truncates to zero")]
+    ZeroQuoteAmount,
     #[msg("Arithmetic overflow")]
     Overflow,
 }

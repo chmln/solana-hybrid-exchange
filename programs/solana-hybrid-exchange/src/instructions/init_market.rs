@@ -56,7 +56,6 @@ pub struct InitMarket<'info> {
 
     pub token_program: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
 }
 
 pub(crate) fn handler(ctx: Context<InitMarket>) -> Result<()> {

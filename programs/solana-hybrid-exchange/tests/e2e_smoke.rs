@@ -14,14 +14,12 @@ use {
     litesvm::LiteSVM,
     solana_hybrid_exchange::{
         accounts as program_accounts, instruction as program_ix,
-        order::{canonical_serialize, Side, SignedOrderArgs, IX_SYSVAR_ID},
+        order::{canonical_serialize, OrderHash, Side, SignedOrderArgs, IX_SYSVAR_ID},
         state::UserAccount,
     },
     solana_keypair::Keypair,
     solana_signer::Signer,
 };
-
-const RENT_SYSVAR_ID: Pubkey = anchor_lang::pubkey!("SysvarRent111111111111111111111111111111111");
 
 fn fresh_svm() -> LiteSVM {
     let mut svm = LiteSVM::new();
@@ -50,7 +48,6 @@ fn build_init_market_ix(
         quote_vault: *quote_vault,
         token_program: spl_token_2022::id(),
         system_program: SYSTEM_PROGRAM_ID,
-        rent: RENT_SYSVAR_ID,
     };
     Instruction::new_with_bytes(
         solana_hybrid_exchange::id(),
@@ -122,8 +119,8 @@ fn build_settle_ix(
     taker: SignedOrderArgs,
     fill_price: u64,
     fill_size: u64,
-    maker_order_hash: [u8; 32],
-    taker_order_hash: [u8; 32],
+    maker_order_hash: OrderHash,
+    taker_order_hash: OrderHash,
 ) -> Instruction {
     let accounts = program_accounts::Settle {
         operator: *operator,
@@ -379,8 +376,8 @@ fn e2e_smoke() {
         taker,
         fill_price,
         fill_size,
-        maker_hash,
-        taker_hash,
+        OrderHash(maker_hash),
+        OrderHash(taker_hash),
     );
 
     send_tx(&mut svm, &[ed_maker, ed_taker, settle], &[&admin]).expect("settle failed");

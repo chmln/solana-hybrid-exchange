@@ -1,11 +1,11 @@
 use anchor_lang::prelude::*;
-use solana_instructions_sysvar::load_instruction_at_checked;
+use solana_instructions_sysvar::{load_current_index_checked, load_instruction_at_checked};
 
 use crate::constants::{MARKET_SEED, ORDER_MARKER_SEED, USER_ACCOUNT_SEED};
 use crate::error::ExchangeError;
 use crate::order::{
-    canonical_serialize, parse_ed25519_precompile_ix, Side, SignedOrderArgs, ED25519_PROGRAM_ID,
-    IX_SYSVAR_ID,
+    canonical_serialize, parse_ed25519_precompile_ix, OrderHash, Side, SignedOrderArgs,
+    ED25519_PROGRAM_ID, IX_SYSVAR_ID,
 };
 use crate::state::{Market, OrderMarker, UserAccount};
 
@@ -15,8 +15,8 @@ use crate::state::{Market, OrderMarker, UserAccount};
     taker: SignedOrderArgs,
     fill_price: u64,
     fill_size: u64,
-    maker_order_hash: [u8; 32],
-    taker_order_hash: [u8; 32],
+    maker_order_hash: OrderHash,
+    taker_order_hash: OrderHash,
 )]
 pub struct Settle<'info> {
     #[account(mut)]
@@ -32,7 +32,7 @@ pub struct Settle<'info> {
         mut,
         seeds = [USER_ACCOUNT_SEED, market.key().as_ref(), maker_user_account.load()?.owner.as_ref()],
         bump = maker_user_account.load()?.bump,
-        constraint = maker_user_account.load()?.market == market.key(),
+        constraint = maker_user_account.load()?.market == market.key() @ ExchangeError::WrongMarket,
     )]
     pub maker_user_account: AccountLoader<'info, UserAccount>,
 
@@ -40,7 +40,7 @@ pub struct Settle<'info> {
         mut,
         seeds = [USER_ACCOUNT_SEED, market.key().as_ref(), taker_user_account.load()?.owner.as_ref()],
         bump = taker_user_account.load()?.bump,
-        constraint = taker_user_account.load()?.market == market.key(),
+        constraint = taker_user_account.load()?.market == market.key() @ ExchangeError::WrongMarket,
     )]
     pub taker_user_account: AccountLoader<'info, UserAccount>,
 
@@ -75,25 +75,24 @@ pub(crate) fn handler(
     taker: SignedOrderArgs,
     fill_price: u64,
     fill_size: u64,
-    maker_order_hash: [u8; 32],
-    taker_order_hash: [u8; 32],
+    maker_order_hash: OrderHash,
+    taker_order_hash: OrderHash,
 ) -> Result<()> {
     let maker_bytes = canonical_serialize(&maker);
     let taker_bytes = canonical_serialize(&taker);
     let expected_maker_hash = solana_sha256_hasher::hashv(&[&maker_bytes]);
     let expected_taker_hash = solana_sha256_hasher::hashv(&[&taker_bytes]);
     require!(
-        expected_maker_hash.to_bytes() == maker_order_hash,
-        ExchangeError::Ed25519DataMismatch
+        expected_maker_hash.to_bytes() == maker_order_hash.0,
+        ExchangeError::OrderHashMismatch
     );
     require!(
-        expected_taker_hash.to_bytes() == taker_order_hash,
-        ExchangeError::Ed25519DataMismatch
+        expected_taker_hash.to_bytes() == taker_order_hash.0,
+        ExchangeError::OrderHashMismatch
     );
 
     let sysvar_ai = ctx.accounts.instructions_sysvar.to_account_info();
-    verify_precompile(&sysvar_ai, 0, &maker, &maker_bytes)?;
-    verify_precompile(&sysvar_ai, 1, &taker, &taker_bytes)?;
+    verify_precompiles(&sysvar_ai, &maker, &maker_bytes, &taker, &taker_bytes)?;
 
     let market_key = ctx.accounts.market.key();
     require_keys_eq!(maker.market, market_key, ExchangeError::WrongMarket);
@@ -133,26 +132,41 @@ pub(crate) fn handler(
     require!(now < earliest_expiry, ExchangeError::OrderExpired);
 
     {
-        let mut maker_marker = ctx
+        // init_if_needed: load_init succeeds on fresh accounts, load_mut on existing ones.
+        let (mut maker_marker, is_fresh) = ctx
             .accounts
             .maker_order_marker
             .load_init()
-            .or_else(|_| ctx.accounts.maker_order_marker.load_mut())?;
+            .map(|r| (r, true))
+            .or_else(|_| {
+                ctx.accounts
+                    .maker_order_marker
+                    .load_mut()
+                    .map(|r| (r, false))
+            })?;
         update_marker(
             &mut maker_marker,
+            is_fresh,
             ctx.bumps.maker_order_marker,
             fill_size,
             maker.max_size,
         )?;
     }
     {
-        let mut taker_marker = ctx
+        let (mut taker_marker, is_fresh) = ctx
             .accounts
             .taker_order_marker
             .load_init()
-            .or_else(|_| ctx.accounts.taker_order_marker.load_mut())?;
+            .map(|r| (r, true))
+            .or_else(|_| {
+                ctx.accounts
+                    .taker_order_marker
+                    .load_mut()
+                    .map(|r| (r, false))
+            })?;
         update_marker(
             &mut taker_marker,
+            is_fresh,
             ctx.bumps.taker_order_marker,
             fill_size,
             taker.max_size,
@@ -167,6 +181,7 @@ pub(crate) fn handler(
     let quote_amount: u64 = quote_amount_u128
         .try_into()
         .map_err(|_| error!(ExchangeError::Overflow))?;
+    require!(quote_amount > 0, ExchangeError::ZeroQuoteAmount);
 
     let mut maker_ua = ctx.accounts.maker_user_account.load_mut()?;
     let mut taker_ua = ctx.accounts.taker_user_account.load_mut()?;
@@ -198,32 +213,49 @@ pub(crate) fn handler(
     Ok(())
 }
 
-fn verify_precompile(
+/// Scan all ixs preceding settle and require an Ed25519 precompile entry matching each of
+/// the maker/taker canonical messages. Positional-agnostic: operators can interleave
+/// ComputeBudget or other prelude ixs freely.
+fn verify_precompiles(
     sysvar_ai: &AccountInfo,
-    index: usize,
-    order: &SignedOrderArgs,
-    expected_message: &[u8],
+    maker: &SignedOrderArgs,
+    maker_bytes: &[u8],
+    taker: &SignedOrderArgs,
+    taker_bytes: &[u8],
 ) -> Result<()> {
-    let ix = load_instruction_at_checked(index, sysvar_ai)
+    let current_idx = load_current_index_checked(sysvar_ai)
         .map_err(|_| error!(ExchangeError::MissingEd25519Verify))?;
-    require_keys_eq!(
-        ix.program_id,
-        ED25519_PROGRAM_ID,
-        ExchangeError::MissingEd25519Verify
-    );
-    let (pubkey, message) = parse_ed25519_precompile_ix(&ix.data)?;
-    require_keys_eq!(pubkey, order.user, ExchangeError::Ed25519DataMismatch);
-    require!(
-        message == expected_message,
-        ExchangeError::Ed25519DataMismatch
-    );
+
+    let mut maker_ok = false;
+    let mut taker_ok = false;
+    for idx in 0..current_idx {
+        let ix = load_instruction_at_checked(idx as usize, sysvar_ai)
+            .map_err(|_| error!(ExchangeError::MissingEd25519Verify))?;
+        if ix.program_id != ED25519_PROGRAM_ID {
+            continue;
+        }
+        let (pubkey, message) = parse_ed25519_precompile_ix(&ix.data)?;
+        if message == maker_bytes {
+            require_keys_eq!(pubkey, maker.user, ExchangeError::Ed25519DataMismatch);
+            maker_ok = true;
+        } else if message == taker_bytes {
+            require_keys_eq!(pubkey, taker.user, ExchangeError::Ed25519DataMismatch);
+            taker_ok = true;
+        }
+    }
+    require!(maker_ok && taker_ok, ExchangeError::MissingEd25519Verify);
     Ok(())
 }
 
-fn update_marker(marker: &mut OrderMarker, bump: u8, fill_size: u64, max_size: u64) -> Result<()> {
-    if marker.bump == 0 {
+fn update_marker(
+    marker: &mut OrderMarker,
+    is_fresh: bool,
+    bump: u8,
+    fill_size: u64,
+    max_size: u64,
+) -> Result<()> {
+    if is_fresh {
         marker.bump = bump;
-        marker.filled_size = 0;
     }
     let new_filled = marker
         .filled_size

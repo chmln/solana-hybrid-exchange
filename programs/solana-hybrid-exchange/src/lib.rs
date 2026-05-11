@@ -7,7 +7,7 @@ pub mod order;
 pub mod state;
 
 pub use crate::instructions::*;
-use crate::order::SignedOrderArgs;
+use crate::order::{OrderHash, SignedOrderArgs};
 
 declare_id!("EjJwgDWLSeFmSf6T1MA8qVDCXSnH2qT4NVMugnb21Vzc");
 
@@ -33,8 +33,8 @@ pub mod solana_hybrid_exchange {
         taker: SignedOrderArgs,
         fill_price: u64,
         fill_size: u64,
-        maker_order_hash: [u8; 32],
-        taker_order_hash: [u8; 32],
+        maker_order_hash: OrderHash,
+        taker_order_hash: OrderHash,
     ) -> Result<()> {
         instructions::settle::handler(
             ctx,

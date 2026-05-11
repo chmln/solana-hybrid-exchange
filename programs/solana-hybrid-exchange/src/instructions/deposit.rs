@@ -57,16 +57,16 @@ pub(crate) fn handler(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         )
     };
 
-    let is_base = mint_key == base_mint;
-    let is_quote = mint_key == quote_mint;
-    require!(is_base || is_quote, ExchangeError::WrongMint);
-
-    if is_base {
-        require_keys_eq!(vault_key, base_vault, ExchangeError::WrongMint);
+    let (expected_vault, is_base) = if mint_key == base_mint {
+        (base_vault, true)
+    } else if mint_key == quote_mint {
+        (quote_vault, false)
     } else {
-        require_keys_eq!(vault_key, quote_vault, ExchangeError::WrongMint);
-    }
+        return err!(ExchangeError::WrongMint);
+    };
+    require_keys_eq!(vault_key, expected_vault, ExchangeError::WrongMint);
 
+    // init_if_needed: load_init succeeds on fresh accounts, load_mut on existing ones.
     let mut user_account = ctx
         .accounts
         .user_account
@@ -75,8 +75,6 @@ pub(crate) fn handler(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     if user_account.owner == Pubkey::default() {
         user_account.owner = ctx.accounts.user.key();
         user_account.market = market_key;
-        user_account.base_free = 0;
-        user_account.quote_free = 0;
         user_account.bump = ctx.bumps.user_account;
     }
 
@@ -95,17 +93,12 @@ pub(crate) fn handler(ctx: Context<Deposit>, amount: u64) -> Result<()> {
     let post = ctx.accounts.vault.amount;
     let delta = post.checked_sub(pre).ok_or(ExchangeError::Overflow)?;
 
-    if is_base {
-        user_account.base_free = user_account
-            .base_free
-            .checked_add(delta)
-            .ok_or(ExchangeError::Overflow)?;
+    let balance = if is_base {
+        &mut user_account.base_free
     } else {
-        user_account.quote_free = user_account
-            .quote_free
-            .checked_add(delta)
-            .ok_or(ExchangeError::Overflow)?;
-    }
+        &mut user_account.quote_free
+    };
+    *balance = balance.checked_add(delta).ok_or(ExchangeError::Overflow)?;
 
     Ok(())
 }

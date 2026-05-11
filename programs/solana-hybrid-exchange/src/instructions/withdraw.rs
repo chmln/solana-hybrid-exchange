@@ -21,8 +21,6 @@ pub struct Withdraw<'info> {
         mut,
         seeds = [USER_ACCOUNT_SEED, market.key().as_ref(), user.key().as_ref()],
         bump = user_account.load()?.bump,
-        constraint = user_account.load()?.market == market.key() @ ExchangeError::InsufficientFreeBalance,
-        constraint = user_account.load()?.owner == user.key() @ ExchangeError::InsufficientFreeBalance,
     )]
     pub user_account: AccountLoader<'info, UserAccount>,
 
@@ -56,29 +54,25 @@ pub(crate) fn handler(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
         )
     };
 
-    let is_base = mint_key == base_mint;
-    let is_quote = mint_key == quote_mint;
-    require!(is_base || is_quote, ExchangeError::WrongMint);
-
-    if is_base {
-        require_keys_eq!(vault_key, base_vault, ExchangeError::WrongMint);
+    let (expected_vault, is_base) = if mint_key == base_mint {
+        (base_vault, true)
+    } else if mint_key == quote_mint {
+        (quote_vault, false)
     } else {
-        require_keys_eq!(vault_key, quote_vault, ExchangeError::WrongMint);
-    }
+        return err!(ExchangeError::WrongMint);
+    };
+    require_keys_eq!(vault_key, expected_vault, ExchangeError::WrongMint);
 
     {
         let mut user_account = ctx.accounts.user_account.load_mut()?;
-        if is_base {
-            user_account.base_free = user_account
-                .base_free
-                .checked_sub(amount)
-                .ok_or(ExchangeError::InsufficientFreeBalance)?;
+        let balance = if is_base {
+            &mut user_account.base_free
         } else {
-            user_account.quote_free = user_account
-                .quote_free
-                .checked_sub(amount)
-                .ok_or(ExchangeError::InsufficientFreeBalance)?;
-        }
+            &mut user_account.quote_free
+        };
+        *balance = balance
+            .checked_sub(amount)
+            .ok_or(ExchangeError::InsufficientFreeBalance)?;
     }
 
     let signer_seeds: &[&[&[u8]]] = &[&[
