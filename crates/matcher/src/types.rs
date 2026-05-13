@@ -79,8 +79,7 @@ pub struct NewOrder {
     pub max_size: Size,
 }
 
-/// Reasons `Book::submit` may reject an order. Both stem from the matcher's invariant
-/// that every emitted fill must produce a non-zero on-chain quote amount.
+/// Reasons `Book::submit` may reject an order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SubmitError {
     /// `max_size == 0` — an empty order cannot match.
@@ -89,6 +88,9 @@ pub enum SubmitError {
     /// single-lamport counterparty. The operator's `price_scale` choice is the
     /// market's price floor; reject below.
     PriceBelowScale,
+    /// Slab is at `u32::MAX - 1` entries; no further slots can be allocated. Cancel
+    /// existing orders to free slots before resubmitting.
+    BookFull,
 }
 
 /// One match output. Emitted via the `on_fill` callback on `Book::submit`.

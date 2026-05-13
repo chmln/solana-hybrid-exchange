@@ -1,6 +1,7 @@
 use matcher::{Book, Fill, NewOrder, OrderId, Price, Side, Size, SubmitError};
 use proptest::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 
 #[derive(Clone, Debug)]
 enum Action {
@@ -50,7 +51,7 @@ proptest! {
     #[test]
     fn book_invariants_hold(actions in proptest::collection::vec(action_strategy(), 1..200)) {
         // price_scale = 1 means every (price >= 1, size >= 1) order passes the precondition.
-        let mut book = Book::new(1);
+        let mut book = Book::new(NonZeroU64::MIN);
         let mut submitted: HashMap<OrderId, NewOrder> = HashMap::new();
         let mut order_of_submission: Vec<OrderId> = Vec::new();
         let mut fills_by_id: HashMap<OrderId, u64> = HashMap::new();
@@ -159,7 +160,7 @@ proptest! {
 // crossed-book scenario from the code-artisan review.
 #[test]
 fn precondition_rejects_dust_and_prevents_crossed_book() {
-    let mut book = Book::new(100);
+    let mut book = Book::new(NonZeroU64::new(100).unwrap());
 
     // Below-scale ask: rejected.
     let err = book

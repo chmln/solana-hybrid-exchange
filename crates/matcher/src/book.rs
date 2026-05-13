@@ -1,46 +1,35 @@
-//! CLOB book: slab-backed orders, intrusive doubly-linked FIFO per price level,
-//! per-side `BTreeMap` of levels, and a cached top-of-book on each side so the
-//! steady-state match walk never touches the BTreeMap.
+//! CLOB book: per-side `BTreeMap` of price levels, each holding an intrusive
+//! doubly-linked FIFO of slab-backed orders. A cached top-of-book per side
+//! gives `best_bid()` / `best_ask()` O(1) and lets the submit loop bail in
+//! O(1) when the taker doesn't cross. The match path itself goes through
+//! `BTreeMap::first_entry()` and operates on the entry handle directly — the
+//! cache is only ever read as a "should I even probe the map" hint, never
+//! used as a key-lookup oracle, so cache/map drift can never trigger a panic.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::btree_map::{BTreeMap, Entry};
+use std::num::NonZeroU64;
 
+use crate::slab::{Slab, SlotIdx};
 use crate::types::{
     BookSnapshot, CancelInfo, Fill, NewOrder, OrderId, OrderView, Price, PriceLevel, Side, Size,
     SubmitError,
 };
 
-const NIL: u32 = u32::MAX;
-
-/// 40 bytes — one cache line per node. No `user` / `nonce` / `expiry`: those live in the
-/// gateway. Empty slots hold their `generation` plus a free-list link in `next`.
-#[derive(Copy, Clone, Debug)]
-struct OrderNode {
-    limit_price: Price,
-    max_size: Size,
-    remaining: Size,
-    prev: u32,
-    next: u32,
-    generation: u32,
-    side: Side,
-    occupied: bool,
-}
-
 #[derive(Copy, Clone, Debug)]
 struct Level {
-    head: u32,
-    tail: u32,
+    head: Option<SlotIdx>,
+    tail: Option<SlotIdx>,
     total_size: Size,
 }
 
 pub struct Book {
-    slab: Vec<OrderNode>,
-    free_head: u32,
+    slab: Slab,
     bids: BTreeMap<Reverse<Price>, Level>,
     asks: BTreeMap<Price, Level>,
     best_bid: Option<Price>,
     best_ask: Option<Price>,
-    price_scale: u64,
+    price_scale: NonZeroU64,
 }
 
 impl Book {
@@ -49,15 +38,13 @@ impl Book {
     /// `quote_amount = fill_price * fill_size / price_scale >= 1` and the on-chain
     /// `ZeroQuoteAmount` check is impossible to trip. Operator picks `price_scale`
     /// per market to balance price granularity against minimum tradeable size.
-    pub fn new(price_scale: u64) -> Self {
+    pub fn new(price_scale: NonZeroU64) -> Self {
         Self::with_capacity(price_scale, 0)
     }
 
-    pub fn with_capacity(price_scale: u64, orders: usize) -> Self {
-        assert!(price_scale > 0, "price_scale must be > 0");
+    pub fn with_capacity(price_scale: NonZeroU64, orders: usize) -> Self {
         Self {
-            slab: Vec::with_capacity(orders),
-            free_head: NIL,
+            slab: Slab::with_capacity(orders),
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             best_bid: None,
@@ -79,9 +66,6 @@ impl Book {
     /// Match `order` against the book, invoking `on_fill` for each fill emitted.
     /// Unfilled remainder rests on the book at `order.limit_price`. Returns the
     /// `OrderId` assigned to the order whether it rested or was fully consumed.
-    ///
-    /// Rejects orders that violate the matcher's no-zero-quote invariant:
-    /// `max_size > 0` and `limit_price >= price_scale`.
     pub fn submit(
         &mut self,
         order: NewOrder,
@@ -90,72 +74,79 @@ impl Book {
         if order.max_size.is_zero() {
             return Err(SubmitError::ZeroSize);
         }
-        if order.limit_price.0 < self.price_scale {
+        if order.limit_price.0 < self.price_scale.get() {
             return Err(SubmitError::PriceBelowScale);
         }
 
-        let taker_idx = self.allocate_slot();
-        let taker_gen = self.slab[taker_idx as usize].generation;
-        let taker_id = OrderId::pack(taker_idx, taker_gen);
-
-        {
-            let n = &mut self.slab[taker_idx as usize];
-            n.limit_price = order.limit_price;
-            n.max_size = order.max_size;
-            n.remaining = order.max_size;
-            n.side = order.side;
-        }
+        let taker_idx = self.slab.allocate().map_err(|_| SubmitError::BookFull)?;
+        let taker_gen = {
+            let node = &mut self.slab[taker_idx];
+            node.limit_price = order.limit_price;
+            node.max_size = order.max_size;
+            node.remaining = order.max_size;
+            node.side = order.side;
+            node.generation
+        };
+        let taker_id = OrderId::pack(taker_idx.raw(), taker_gen);
 
         let opp = order.side.opposite();
         loop {
-            let taker_remaining = self.slab[taker_idx as usize].remaining;
+            let taker_remaining = self.slab[taker_idx].remaining;
             if taker_remaining.is_zero() {
                 break;
             }
-            let Some(best) = self.cached_best(opp) else {
+            // Fast-bail via the cached best: avoids any BTreeMap touch on the
+            // common "doesn't cross, just rest" path.
+            let Some(best_opp) = self.best_for(opp) else {
                 break;
             };
-            if !crosses(order.side, order.limit_price, best) {
+            if !crosses(order.side, order.limit_price, best_opp) {
                 break;
             }
 
-            let (maker_idx, maker_remaining, maker_gen) = {
-                let level = self
-                    .level_get(opp, best)
-                    .expect("cached best with no level");
-                let head = level.head;
-                let n = &self.slab[head as usize];
-                (head, n.remaining, n.generation)
+            let outcome = match opp {
+                Side::Bid => match_against_top(
+                    &mut self.bids,
+                    &mut self.slab,
+                    |k| k.0,
+                    order.side,
+                    order.limit_price,
+                    taker_idx,
+                    taker_id,
+                    taker_remaining,
+                    &mut on_fill,
+                ),
+                Side::Ask => match_against_top(
+                    &mut self.asks,
+                    &mut self.slab,
+                    |k| *k,
+                    order.side,
+                    order.limit_price,
+                    taker_idx,
+                    taker_id,
+                    taker_remaining,
+                    &mut on_fill,
+                ),
             };
-
-            let fill_size = std::cmp::min(taker_remaining, maker_remaining);
-            let fill_price = best;
-
-            // `submit`'s precondition (`limit_price >= price_scale`) guarantees both sides
-            // satisfy `limit >= price_scale`, hence `fill_price * fill_size / price_scale
-            // >= fill_size >= 1`. No zero-quote check needed in the walk.
-
-            on_fill(Fill {
-                maker_id: OrderId::pack(maker_idx, maker_gen),
-                taker_id,
-                fill_price,
-                fill_size,
-            });
-
-            self.slab[taker_idx as usize].remaining = Size(taker_remaining.0 - fill_size.0);
-
-            if maker_remaining == fill_size {
-                self.pop_front(opp, best);
-                self.free_slot(maker_idx);
-            } else {
-                self.slab[maker_idx as usize].remaining = Size(maker_remaining.0 - fill_size.0);
-                let level = self.level_get_mut(opp, best).unwrap();
-                level.total_size = Size(level.total_size.0 - fill_size.0);
+            match outcome {
+                MatchOutcome::NoMatch => break,
+                MatchOutcome::Partial => {}
+                MatchOutcome::FullyConsumed {
+                    maker_idx,
+                    level_emptied,
+                } => {
+                    self.slab.free(maker_idx);
+                    if level_emptied {
+                        // The emptied level was the top — `best_opp` reflected
+                        // its price — so we always need to recompute.
+                        self.recompute_best(opp);
+                    }
+                }
             }
         }
 
-        if self.slab[taker_idx as usize].remaining.is_zero() {
-            self.free_slot(taker_idx);
+        if self.slab[taker_idx].remaining.is_zero() {
+            self.slab.free(taker_idx);
         } else {
             self.append_to_level(order.side, order.limit_price, taker_idx);
         }
@@ -165,8 +156,8 @@ impl Book {
 
     /// Cancel `id` if it currently rests. Returns `None` for stale or fully-consumed ids.
     pub fn cancel(&mut self, id: OrderId) -> Option<CancelInfo> {
-        let idx = id.idx() as usize;
-        let node = self.slab.get(idx)?;
+        let idx = self.slab.lookup_raw(id.idx())?;
+        let node = &self.slab[idx];
         if !node.occupied || node.generation != id.generation() {
             return None;
         }
@@ -176,31 +167,34 @@ impl Book {
         let prev = node.prev;
         let next = node.next;
 
-        if prev != NIL {
-            self.slab[prev as usize].next = next;
-        }
-        if next != NIL {
-            self.slab[next as usize].prev = prev;
-        }
-
-        let level_empty = {
-            let level = self.level_get_mut(side, price).expect("level must exist");
-            if level.head == idx as u32 {
-                level.head = next;
-            }
-            if level.tail == idx as u32 {
-                level.tail = prev;
-            }
-            level.total_size = Size(level.total_size.0 - remaining.0);
-            level.head == NIL
+        let result = match side {
+            Side::Bid => unlink_from_level(
+                &mut self.bids,
+                Reverse(price),
+                idx,
+                prev,
+                next,
+                remaining,
+                &mut self.slab,
+            ),
+            Side::Ask => unlink_from_level(
+                &mut self.asks,
+                price,
+                idx,
+                prev,
+                next,
+                remaining,
+                &mut self.slab,
+            ),
         };
-
-        if level_empty {
-            self.level_remove(side, price);
-            self.maybe_recompute_best_on_remove(side, price);
+        match result {
+            UnlinkResult::Missing => return None,
+            UnlinkResult::Kept => self.slab.free(idx),
+            UnlinkResult::Removed => {
+                self.slab.free(idx);
+                self.maybe_recompute_best_on_remove(side, price);
+            }
         }
-
-        self.free_slot(idx as u32);
 
         Some(CancelInfo {
             side,
@@ -211,7 +205,8 @@ impl Book {
 
     /// Read-only view of `id` if it currently rests.
     pub fn get(&self, id: OrderId) -> Option<OrderView> {
-        let node = self.slab.get(id.idx() as usize)?;
+        let idx = self.slab.lookup_raw(id.idx())?;
+        let node = &self.slab[idx];
         if !node.occupied || node.generation != id.generation() {
             return None;
         }
@@ -247,156 +242,31 @@ impl Book {
         BookSnapshot { bids, asks }
     }
 
-    // --- Internal helpers --------------------------------------------------
-
-    fn allocate_slot(&mut self) -> u32 {
-        if self.free_head != NIL {
-            let idx = self.free_head;
-            self.free_head = self.slab[idx as usize].next;
-            let generation = self.slab[idx as usize].generation;
-            self.slab[idx as usize] = OrderNode {
-                limit_price: Price(0),
-                max_size: Size(0),
-                remaining: Size(0),
-                prev: NIL,
-                next: NIL,
-                generation,
-                side: Side::Bid,
-                occupied: true,
-            };
-            idx
-        } else {
-            let idx = self.slab.len() as u32;
-            self.slab.push(OrderNode {
-                limit_price: Price(0),
-                max_size: Size(0),
-                remaining: Size(0),
-                prev: NIL,
-                next: NIL,
-                generation: 0,
-                side: Side::Bid,
-                occupied: true,
-            });
-            idx
-        }
-    }
-
-    fn free_slot(&mut self, idx: u32) {
-        let next_free = self.free_head;
-        let node = &mut self.slab[idx as usize];
-        node.limit_price = Price(0);
-        node.max_size = Size(0);
-        node.remaining = Size(0);
-        node.prev = NIL;
-        node.next = next_free;
-        node.generation = node.generation.wrapping_add(1);
-        node.side = Side::Bid;
-        node.occupied = false;
-        self.free_head = idx;
-    }
-
-    fn append_to_level(&mut self, side: Side, price: Price, idx: u32) {
-        let remaining = self.slab[idx as usize].remaining;
-        self.slab[idx as usize].prev = NIL;
-        self.slab[idx as usize].next = NIL;
-
-        let prev_tail = match self.level_get_mut(side, price) {
-            Some(level) => {
-                let t = level.tail;
-                level.tail = idx;
-                level.total_size = Size(level.total_size.0 + remaining.0);
-                Some(t)
-            }
-            None => {
-                self.level_insert(
-                    side,
-                    price,
-                    Level {
-                        head: idx,
-                        tail: idx,
-                        total_size: remaining,
-                    },
-                );
-                self.maybe_update_best_on_insert(side, price);
-                None
-            }
-        };
-
-        if let Some(tail) = prev_tail {
-            self.slab[tail as usize].next = idx;
-            self.slab[idx as usize].prev = tail;
-        }
-    }
-
-    /// Pops head of `(side, price)`. Caller is responsible for freeing the returned slot.
-    /// Panics in debug if the level doesn't exist.
-    fn pop_front(&mut self, side: Side, price: Price) -> u32 {
-        let head_idx = self.level_get(side, price).expect("level must exist").head;
-
-        let (next_idx, head_remaining) = {
-            let n = &self.slab[head_idx as usize];
-            (n.next, n.remaining)
-        };
-
+    fn append_to_level(&mut self, side: Side, price: Price, idx: SlotIdx) {
+        let remaining = self.slab[idx].remaining;
         {
-            let level = self.level_get_mut(side, price).unwrap();
-            level.head = next_idx;
-            level.total_size = Size(level.total_size.0 - head_remaining.0);
-            if next_idx == NIL {
-                level.tail = NIL;
-            }
+            let node = &mut self.slab[idx];
+            node.prev = None;
+            node.next = None;
         }
-
-        if next_idx != NIL {
-            self.slab[next_idx as usize].prev = NIL;
-        } else {
-            self.level_remove(side, price);
-            self.maybe_recompute_best_on_remove(side, price);
+        let result = match side {
+            Side::Bid => append_to_map_level(&mut self.bids, Reverse(price), idx, remaining),
+            Side::Ask => append_to_map_level(&mut self.asks, price, idx, remaining),
+        };
+        if let Some(tail) = result.prev_tail {
+            self.slab[tail].next = Some(idx);
+            self.slab[idx].prev = Some(tail);
         }
-        head_idx
+        if result.level_created {
+            self.maybe_update_best_on_insert(side, price);
+        }
     }
 
     #[inline]
-    fn cached_best(&self, side: Side) -> Option<Price> {
+    fn best_for(&self, side: Side) -> Option<Price> {
         match side {
             Side::Bid => self.best_bid,
             Side::Ask => self.best_ask,
-        }
-    }
-
-    fn level_get(&self, side: Side, price: Price) -> Option<&Level> {
-        match side {
-            Side::Bid => self.bids.get(&Reverse(price)),
-            Side::Ask => self.asks.get(&price),
-        }
-    }
-
-    fn level_get_mut(&mut self, side: Side, price: Price) -> Option<&mut Level> {
-        match side {
-            Side::Bid => self.bids.get_mut(&Reverse(price)),
-            Side::Ask => self.asks.get_mut(&price),
-        }
-    }
-
-    fn level_insert(&mut self, side: Side, price: Price, level: Level) {
-        match side {
-            Side::Bid => {
-                self.bids.insert(Reverse(price), level);
-            }
-            Side::Ask => {
-                self.asks.insert(price, level);
-            }
-        }
-    }
-
-    fn level_remove(&mut self, side: Side, price: Price) {
-        match side {
-            Side::Bid => {
-                self.bids.remove(&Reverse(price));
-            }
-            Side::Ask => {
-                self.asks.remove(&price);
-            }
         }
     }
 
@@ -428,6 +298,169 @@ impl Book {
                 }
             }
         }
+    }
+
+    fn recompute_best(&mut self, side: Side) {
+        match side {
+            Side::Bid => self.best_bid = self.bids.keys().next().map(|r| r.0),
+            Side::Ask => self.best_ask = self.asks.keys().next().copied(),
+        }
+    }
+}
+
+enum MatchOutcome {
+    NoMatch,
+    Partial,
+    FullyConsumed {
+        maker_idx: SlotIdx,
+        level_emptied: bool,
+    },
+}
+
+struct AppendResult {
+    prev_tail: Option<SlotIdx>,
+    level_created: bool,
+}
+
+enum UnlinkResult {
+    Missing,
+    Kept,
+    Removed,
+}
+
+/// One iteration of the match walk against the top of `map`. The outer caller
+/// has already used its cached best to fast-bail on the no-cross case; this
+/// function defensively re-checks crosses against the map's actual top, so a
+/// stale cache cannot cause incorrect fills — it can only cause a redundant
+/// entry into this function which then returns `NoMatch`.
+#[allow(clippy::too_many_arguments)]
+fn match_against_top<K: Ord>(
+    map: &mut BTreeMap<K, Level>,
+    slab: &mut Slab,
+    key_to_price: impl Fn(&K) -> Price,
+    taker_side: Side,
+    taker_limit: Price,
+    taker_idx: SlotIdx,
+    taker_id: OrderId,
+    taker_remaining: Size,
+    on_fill: &mut impl FnMut(Fill),
+) -> MatchOutcome {
+    let Some(mut entry) = map.first_entry() else {
+        return MatchOutcome::NoMatch;
+    };
+    let best = key_to_price(entry.key());
+    if !crosses(taker_side, taker_limit, best) {
+        return MatchOutcome::NoMatch;
+    }
+
+    let level = entry.get_mut();
+    let Some(head_idx) = level.head else {
+        // Empty level shouldn't be in the map (we remove on empty), but if it
+        // is, treat as no match.
+        return MatchOutcome::NoMatch;
+    };
+    let head_node = &slab[head_idx];
+    let head_remaining = head_node.remaining;
+    let head_gen = head_node.generation;
+    let head_next = head_node.next;
+
+    let fill_size = taker_remaining.min(head_remaining);
+
+    on_fill(Fill {
+        maker_id: OrderId::pack(head_idx.raw(), head_gen),
+        taker_id,
+        fill_price: best,
+        fill_size,
+    });
+
+    slab[taker_idx].remaining = Size(taker_remaining.0 - fill_size.0);
+
+    if head_remaining == fill_size {
+        if let Some(next) = head_next {
+            level.head = Some(next);
+            level.total_size = Size(level.total_size.0 - head_remaining.0);
+            slab[next].prev = None;
+            MatchOutcome::FullyConsumed {
+                maker_idx: head_idx,
+                level_emptied: false,
+            }
+        } else {
+            entry.remove();
+            MatchOutcome::FullyConsumed {
+                maker_idx: head_idx,
+                level_emptied: true,
+            }
+        }
+    } else {
+        slab[head_idx].remaining = Size(head_remaining.0 - fill_size.0);
+        level.total_size = Size(level.total_size.0 - fill_size.0);
+        MatchOutcome::Partial
+    }
+}
+
+fn append_to_map_level<K: Ord>(
+    map: &mut BTreeMap<K, Level>,
+    key: K,
+    idx: SlotIdx,
+    remaining: Size,
+) -> AppendResult {
+    match map.entry(key) {
+        Entry::Occupied(mut e) => {
+            let level = e.get_mut();
+            let prev_tail = level.tail;
+            level.tail = Some(idx);
+            level.total_size = Size(level.total_size.0 + remaining.0);
+            AppendResult {
+                prev_tail,
+                level_created: false,
+            }
+        }
+        Entry::Vacant(e) => {
+            e.insert(Level {
+                head: Some(idx),
+                tail: Some(idx),
+                total_size: remaining,
+            });
+            AppendResult {
+                prev_tail: None,
+                level_created: true,
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unlink_from_level<K: Ord>(
+    map: &mut BTreeMap<K, Level>,
+    key: K,
+    idx: SlotIdx,
+    prev: Option<SlotIdx>,
+    next: Option<SlotIdx>,
+    remaining: Size,
+    slab: &mut Slab,
+) -> UnlinkResult {
+    let Entry::Occupied(mut entry) = map.entry(key) else {
+        return UnlinkResult::Missing;
+    };
+    if let Some(p) = prev {
+        slab[p].next = next;
+    }
+    if let Some(n) = next {
+        slab[n].prev = prev;
+    }
+    let level = entry.get_mut();
+    if level.head == Some(idx) {
+        level.head = next;
+    }
+    if level.tail == Some(idx) {
+        level.tail = prev;
+    }
+    level.total_size = Size(level.total_size.0 - remaining.0);
+    if level.head.is_none() {
+        entry.remove();
+        UnlinkResult::Removed
+    } else {
+        UnlinkResult::Kept
     }
 }
 

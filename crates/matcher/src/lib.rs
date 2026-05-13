@@ -13,6 +13,7 @@
 //!   `Side` (which uses `Bid = 0, Ask = 1`) when building settle txs.
 
 mod book;
+mod slab;
 mod types;
 
 pub use book::Book;

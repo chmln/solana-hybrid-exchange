@@ -1,8 +1,9 @@
 use matcher::{Book, NewOrder, Price, PriceLevel, Side, Size};
+use std::num::NonZeroU64;
 
 #[test]
 fn empty_book_submit_rests() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     let mut fills = Vec::new();
     let id = book
         .submit(
@@ -24,7 +25,7 @@ fn empty_book_submit_rests() {
 
 #[test]
 fn exact_size_match() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     let ask_id = book
         .submit(
             NewOrder {
@@ -59,7 +60,7 @@ fn exact_size_match() {
 
 #[test]
 fn partial_taker() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     book.submit(
         NewOrder {
             side: Side::Ask,
@@ -90,7 +91,7 @@ fn partial_taker() {
 
 #[test]
 fn partial_maker() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     let ask_id = book
         .submit(
             NewOrder {
@@ -120,7 +121,7 @@ fn partial_maker() {
 
 #[test]
 fn multi_level_walk() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     for price in [10u64, 11, 12] {
         book.submit(
             NewOrder {
@@ -164,7 +165,7 @@ fn multi_level_walk() {
 
 #[test]
 fn no_cross_rests_separately() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     let mut fills = Vec::new();
     book.submit(
         NewOrder {
@@ -191,7 +192,7 @@ fn no_cross_rests_separately() {
 
 #[test]
 fn cancel_resting() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     let id = book
         .submit(
             NewOrder {
@@ -212,7 +213,7 @@ fn cancel_resting() {
 
 #[test]
 fn cancel_stale_id() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     let ask_id = book
         .submit(
             NewOrder {
@@ -238,7 +239,7 @@ fn cancel_stale_id() {
 
 #[test]
 fn fifo_within_level() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     let first = book
         .submit(
             NewOrder {
@@ -275,7 +276,7 @@ fn fifo_within_level() {
 
 #[test]
 fn self_trade_allowed() {
-    let mut book = Book::new(1);
+    let mut book = Book::new(NonZeroU64::MIN);
     book.submit(
         NewOrder {
             side: Side::Ask,

@@ -1,7 +1,13 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use matcher::{Book, NewOrder, Price, Side, Size};
+use std::num::NonZeroU64;
 
-fn book_with_resting_asks(price_scale: u64, levels: u64, size_per: u64, start_price: u64) -> Book {
+fn book_with_resting_asks(
+    price_scale: NonZeroU64,
+    levels: u64,
+    size_per: u64,
+    start_price: u64,
+) -> Book {
     let mut book = Book::with_capacity(price_scale, levels as usize);
     for p in 0..levels {
         book.submit(
@@ -17,7 +23,7 @@ fn book_with_resting_asks(price_scale: u64, levels: u64, size_per: u64, start_pr
     book
 }
 
-fn book_with_levels_both_sides(price_scale: u64, levels: u64, size_per: u64) -> Book {
+fn book_with_levels_both_sides(price_scale: NonZeroU64, levels: u64, size_per: u64) -> Book {
     let mut book = Book::with_capacity(price_scale, levels as usize * 2);
     for p in 0..levels {
         book.submit(
@@ -46,7 +52,7 @@ fn book_with_levels_both_sides(price_scale: u64, levels: u64, size_per: u64) -> 
 fn bench_submit_rest_no_cross(c: &mut Criterion) {
     c.bench_function("submit_rest_no_cross", |b| {
         b.iter_batched_ref(
-            || Book::with_capacity(1, 1024),
+            || Book::with_capacity(NonZeroU64::MIN, 1024),
             |book| {
                 book.submit(
                     black_box(NewOrder {
@@ -67,7 +73,7 @@ fn bench_submit_rest_no_cross(c: &mut Criterion) {
 fn bench_submit_consume_one_maker(c: &mut Criterion) {
     c.bench_function("submit_consume_one_maker", |b| {
         b.iter_batched_ref(
-            || book_with_resting_asks(1, 1, 100, 10),
+            || book_with_resting_asks(NonZeroU64::MIN, 1, 100, 10),
             |book| {
                 book.submit(
                     black_box(NewOrder {
@@ -88,7 +94,7 @@ fn bench_submit_consume_one_maker(c: &mut Criterion) {
 fn bench_submit_walk_10_levels_full_sweep(c: &mut Criterion) {
     c.bench_function("submit_walk_10_levels_full_sweep", |b| {
         b.iter_batched_ref(
-            || book_with_resting_asks(1, 10, 10, 10),
+            || book_with_resting_asks(NonZeroU64::MIN, 10, 10, 10),
             |book| {
                 book.submit(
                     black_box(NewOrder {
@@ -111,7 +117,7 @@ fn bench_submit_walk_10_levels_full_sweep(c: &mut Criterion) {
 fn bench_submit_walk_100_levels_full_sweep(c: &mut Criterion) {
     c.bench_function("submit_walk_100_levels_full_sweep", |b| {
         b.iter_batched_ref(
-            || book_with_resting_asks(1, 100, 10, 100),
+            || book_with_resting_asks(NonZeroU64::MIN, 100, 10, 100),
             |book| {
                 book.submit(
                     black_box(NewOrder {
@@ -132,7 +138,7 @@ fn bench_submit_walk_100_levels_full_sweep(c: &mut Criterion) {
 fn bench_submit_partial_then_rest(c: &mut Criterion) {
     c.bench_function("submit_partial_then_rest", |b| {
         b.iter_batched_ref(
-            || book_with_resting_asks(1, 1, 50, 10),
+            || book_with_resting_asks(NonZeroU64::MIN, 1, 50, 10),
             |book| {
                 book.submit(
                     black_box(NewOrder {
@@ -154,7 +160,7 @@ fn bench_cancel_resting_at_known_id(c: &mut Criterion) {
     c.bench_function("cancel_resting_at_known_id", |b| {
         b.iter_batched(
             || {
-                let mut book = Book::with_capacity(1, 4);
+                let mut book = Book::with_capacity(NonZeroU64::MIN, 4);
                 let id = book
                     .submit(
                         NewOrder {
@@ -179,7 +185,7 @@ fn bench_cancel_resting_at_known_id(c: &mut Criterion) {
 fn bench_snapshot_top_10_with_50_levels(c: &mut Criterion) {
     c.bench_function("snapshot_top_10_with_50_levels", |b| {
         b.iter_batched_ref(
-            || book_with_levels_both_sides(1, 50, 10),
+            || book_with_levels_both_sides(NonZeroU64::MIN, 50, 10),
             |book| {
                 black_box(book.snapshot(black_box(10)));
             },
