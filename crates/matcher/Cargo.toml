@@ -1,0 +1,16 @@
+[package]
+name = "matcher"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "match"
+harness = false
